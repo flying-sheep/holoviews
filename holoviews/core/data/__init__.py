@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import copy
 import types
 from collections.abc import Mapping
@@ -302,7 +304,7 @@ class Dataset(Element, metaclass=PipelineMeta):
     _vdim_reductions = {}
     _kdim_reductions = {}
 
-    interface: Interface
+    interface: type[Interface]
 
     def __new__(cls, data=None, kdims=None, vdims=None, **kwargs):
         """Allows casting a DynamicMap to an Element class like hv.Curve, by applying the
@@ -414,11 +416,11 @@ class Dataset(Element, metaclass=PipelineMeta):
         return obj_dict
 
     @property
-    def redim(self):
+    def redim(self) -> Redim:
         return Redim(self, mode="dataset")
 
     @property
-    def dataset(self):
+    def dataset(self) -> Dataset:
         """The Dataset that this object was created from"""
         if self._dataset is None:
             if type(self) is Dataset:
@@ -448,7 +450,7 @@ class Dataset(Element, metaclass=PipelineMeta):
         """
         return self._pipeline
 
-    def compute(self):
+    def compute(self) -> Dataset:
         """Computes the data to a data format that stores the daata in
         memory, e.g. a Dask dataframe or array is converted to a
         Pandas DataFrame or NumPy array.
@@ -459,7 +461,7 @@ class Dataset(Element, metaclass=PipelineMeta):
         """
         return self.interface.compute(self)
 
-    def persist(self):
+    def persist(self) -> Dataset:
         """Persists the results of a lazy data interface to memory to
         speed up data manipulation and visualization. If the
         particular data backend already holds the data in memory

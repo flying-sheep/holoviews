@@ -224,11 +224,13 @@ class DendrogramPlot(PathPlot):
         side_dim = f"{dim}s"
         data = side.renderers[0].data_source.data
         if isinstance(getattr(main, f"{dim}_range"), FactorRange):
-            # 0.5 is the factor used by Bokeh to convert a synthetic
-            # coordinate into a categorical factor.
-            # data_min.min() will for Scipy dendogram calculation be 5.
+            # Scipy (and the dendrogram operation) always lay out leaves in
+            # width-10 slots (e.g. 5, 15, 25, ... for single-item leaves, or
+            # wider for leaves aligned to a group of items). Bokeh centers
+            # categorical factor i at i + 0.5, so dividing by 10 converts
+            # directly, regardless of whether leaves have uniform width.
             data_adj = np.asarray(data[side_dim])
-            data[side_dim] = list(0.5 / data_adj.min() * data_adj)
+            data[side_dim] = list(data_adj / 10)
         else:
             main_src = main.renderers[0].data_source.data
             data_adj, data_main = (

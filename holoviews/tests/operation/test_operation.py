@@ -1332,6 +1332,53 @@ class TestDendrogramOperation:
         data = amain.renderers[0].data_source.data
         assert list(data["zvalues"]) == list(map(int, data["data"]))
 
+    def _group_dataset(self):
+        # 'cell' is grouped (many-to-one) by 'cell_type': group A has 2
+        # members, group B has 3, so leaves should not be evenly spaced.
+        cell_type = {"c0": "A", "c1": "A", "c2": "B", "c3": "B", "c4": "B"}
+        genes = ["g0", "g1", "g2"]
+        base = {"A": 0, "B": 100}
+        rows = [
+            {"gene": g, "cell": c, "cell_type": ct, "value": base[ct] + gi + ci}
+            for gi, g in enumerate(genes)
+            for ci, (c, ct) in enumerate(cell_type.items())
+        ]
+        return pd.DataFrame(rows)
+
+    def test_group_dim_right(self):
+        df = self._group_dataset()
+        plot = hv.HeatMap(df, kdims=["gene", "cell"], vdims=["value", "cell_type"])
+        dendro = dendrogram(
+            plot, adjoint_dims=["cell_type"], main_dim="value", linkage_metric="euclidean"
+        )
+        assert isinstance(dendro, hv.AdjointLayout)
+        assert isinstance(dendro["right"], hv.Dendrogram)
+        assert isinstance(dendro["top"], hv.Empty)
+
+        main = dendro["main"]
+        cell_order = list(main.dimension_values("cell", expanded=False))
+        cell_type = dict(zip(df["cell"], df["cell_type"], strict=True))
+        groups_in_order = [cell_type[c] for c in cell_order]
+        # Members of the same group must be contiguous.
+        assert groups_in_order in (["A", "A", "B", "B", "B"], ["B", "B", "B", "A", "A"])
+
+        sizes = [2, 3] if groups_in_order[0] == "A" else [3, 2]
+        start = 0
+        expected_centers = []
+        for s in sizes:
+            expected_centers.append((start + s / 2) * 10)
+            start += s
+        right = dendro["right"]
+        x = right.dimension_values(0)
+        np.testing.assert_allclose(sorted(set(x)), sorted(expected_centers))
+
+    def test_group_dim_not_a_group_raises(self):
+        df = self._group_dataset()
+        plot = hv.HeatMap(df, kdims=["gene", "cell"], vdims=["value", "cell_type"])
+        msg = "'value' in 'adjoint_dims' is not one of the first two kdims"
+        with pytest.raises(ValueError, match=msg):
+            dendrogram(plot, adjoint_dims=["value"], main_dim="value")
+
 
 @pytest.mark.usefixtures("bokeh_backend")
 def test_compositor_operations_size():

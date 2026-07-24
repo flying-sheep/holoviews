@@ -6,9 +6,10 @@ examples.
 from __future__ import annotations
 
 import warnings
-from collections import defaultdict
+from collections import Counter, defaultdict
 from functools import partial
 from itertools import pairwise
+from typing import TYPE_CHECKING
 
 import narwhals.stable.v2 as nw
 import numpy as np
@@ -50,7 +51,10 @@ from ..element.raster import RGB, HeatMap, Image
 from ..element.util import categorical_aggregate2d  # noqa: F401
 from ..streams import RangeXY
 from ..util.locator import MaxNLocator
-from ..util.warnings import warn
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+
 
 column_interfaces = [ArrayInterface, DictInterface, PandasInterface]
 
@@ -1497,7 +1501,16 @@ class dendrogram(Operation):
         default=True, doc="Whether to adjoin the dendrogram(s) to the main plot"
     )
 
-    adjoint_dims = param.List(item_type=str, doc="The adjoint dimension to cluster on")
+    adjoint_dims = param.List(
+        item_type=str,
+        doc="""
+        The dimensions to cluster on. Each entry must either be one of the
+        first two kdims of the element, or a categorical dimension that
+        uniquely groups one of those two kdims (i.e. each value of the kdim
+        maps to exactly one value of the grouping dimension). In the latter
+        case, the linkage is computed on the per-group mean of 'main_dim' and
+        the dendrogram leaves are aligned to the center of each group.""",
+    )
 
     main_dim = param.String(default=None, allow_None=False, doc="The main dimension to cluster on")
 
@@ -1566,18 +1579,12 @@ class dendrogram(Operation):
         doc="Whether to invert the dendrogram axis.",
     )
 
-    def _compute_linkage(self, dataset, dim, vdim):
+    def _linkage(self, X, labels):
         try:
             from scipy.cluster.hierarchy import dendrogram, linkage
         except ImportError:
             raise ImportError("scipy is needed for the dendrogram operation") from None
 
-        arrays, labels = [], []
-        for k, v in dataset.groupby(dim, container_type=list, group_type=Dataset):
-            labels.append(k)
-            arrays.append(v.dimension_values(vdim))
-
-        X = np.vstack(arrays)
         try:
             Z = linkage(
                 X,
@@ -1588,7 +1595,95 @@ class dendrogram(Operation):
         except ValueError as e:
             msg = "Could not calculate linkage for dendrogram, try changing 'linkage_metric' or 'linkage_method'."
             raise ValueError(msg) from e
-        return dendrogram(Z, labels=labels, no_plot=True)
+        return dendrogram(Z, labels=labels, no_plot=True), Z
+
+    def _compute_linkage(self, dataset: Dataset, dim: str, vdim: str):
+        arrays, labels = [], []
+        for k, v in dataset.groupby(dim, container_type=list, group_type=Dataset):
+            labels.append(k)
+            arrays.append(v.dimension_values(vdim))
+
+        X = np.vstack(arrays)
+        ddata, _Z = self._linkage(X, labels)
+        return ddata
+
+    def _compute_grouped_linkage(self, dataset: Dataset, group_dim: str, other_dim: str, vdim: str):
+        """Compute linkage on the per-group mean of ``vdim``, i.e. treat each
+        unique value of ``group_dim`` as a single leaf, aggregating over all
+        the (many-to-one) axis values that share that group.
+        """
+        df = dataset.dframe([group_dim, other_dim, vdim])
+        pivot = df.pivot_table(
+            index=group_dim, columns=other_dim, values=vdim, aggfunc="mean", sort=False
+        )
+        return self._linkage(pivot.to_numpy(), list(pivot.index))
+
+    def _resolve_group_dims(self, dataset: Dataset, axis_names: Iterable[str]):
+        """Map each axis (one of the first two kdims) that should be
+        clustered via a grouping dimension to that grouping dimension.
+        """
+        direct = set(axis_names) & set(map(str, self.p.adjoint_dims))
+        group_map = {}
+        for g in map(str, self.p.adjoint_dims):
+            if g in direct:
+                continue
+            matches = [
+                axis
+                for axis in axis_names
+                if axis not in direct
+                and axis not in group_map
+                and dataset.dframe([axis, g])
+                .groupby(axis, observed=True)[g]
+                .nunique(dropna=False)
+                .le(1)
+                .all()
+            ]
+            if len(matches) == 1:
+                group_map[matches[0]] = g
+            elif len(matches) > 1:
+                msg = (
+                    f"'{g}' in 'adjoint_dims' groups more than one of the first two kdims "
+                    f"({', '.join(matches)}); it must uniquely group only one of them."
+                )
+                raise ValueError(msg)
+            else:
+                axis_names_str = ", ".join(axis_names)
+                msg = (
+                    f"'{g}' in 'adjoint_dims' is not one of the first two kdims ({axis_names_str}) "
+                    "and does not uniquely group either of them (i.e. some value of that kdim "
+                    f"is associated with more than one value of '{g}')."
+                )
+                raise ValueError(msg)
+        return group_map
+
+    def _grouped_order_and_icoord(self, dataset: Dataset, axis_dim, group_dim, ddata, Z, sign):
+        axis_vals = dataset.dimension_values(axis_dim)
+        group_vals = dataset.dimension_values(group_dim)
+
+        # axis_dim -> group_dim is a function (checked in _resolve_group_dims),
+        # so the last write for a given axis value is consistent.
+        sizes_by_label = Counter(dict(zip(axis_vals, group_vals, strict=True)).values())
+
+        rank = {label: i for i, label in enumerate(ddata["ivl"])}
+        code_map = defaultdict(lambda: len(code_map))
+        suborder = list(map(code_map.__getitem__, axis_vals))
+        n_axis = len(code_map)
+        order = [
+            sign * (rank[g] * (n_axis + 1) + so)
+            for g, so in zip(group_vals, suborder, strict=True)
+        ]
+
+        # Leaves are spaced 10 apart by scipy; scale each leaf's slot width by
+        # its group size so the leaf sits at the center of its group's block.
+        sizes = np.asarray([sizes_by_label[label] for label in ddata["ivl"]], dtype=float)
+        starts = np.concatenate([[0], np.cumsum(sizes)[:-1]])
+        centers = (starts + sizes / 2) * 10
+        pos = dict(zip(ddata["leaves"], centers, strict=True))
+        n = len(ddata["leaves"])
+        for i, (a, b, _dist, _cnt) in enumerate(Z):
+            pos[n + i] = (pos[int(a)] + pos[int(b)]) / 2
+        icoord = [[pos[int(a)], pos[int(a)], pos[int(b)], pos[int(b)]] for a, b, _dist, _cnt in Z]
+        return order, icoord
 
     def _process(self, element, key=None):
         if self.p.main_dim is None:
@@ -1604,19 +1699,13 @@ class dendrogram(Operation):
             dataset = Dataset(element)
         sign = -1 if self.p.invert else 1
         sort_dims, dendros = [], {}
-        if adjoint_not_kdims := (
-            set(map(str, self.p.adjoint_dims)) - set(map(str, element_kdims[:2]))
-        ):
-            # Should be removed when https://github.com/holoviz/holoviews/issues/6683
-            # is implemented
-            adjoint_not_kdims_str = ", ".join(sorted(map(str, adjoint_not_kdims)))
-            msg = "Currently, 'adjoint_dims' can only be one of the first two kdims"
-            msg += f", {adjoint_not_kdims_str} is not."
-            warn(msg, UserWarning)
-        for d in map(str, element_kdims[:2]):
+        axis_names = list(map(str, element_kdims[:2]))
+        group_map = self._resolve_group_dims(dataset, axis_names)
+        for d in axis_names:
             sort_dim = f"sort_{d}"
             sort_dims.append(sort_dim)
-            if d not in self.p.adjoint_dims:
+            group_dim = group_map.get(d)
+            if d not in self.p.adjoint_dims and group_dim is None:
                 # This is needed because unstable sorting algorithms, which can
                 # differ between OSs, causing change in ordering on a
                 # non-selected axis:
@@ -1631,16 +1720,23 @@ class dendrogram(Operation):
                 dataset = dataset.add_dimension(sort_dim, 0, order)
                 continue
 
-            ddata = self._compute_linkage(dataset, d, self.p.main_dim)
-            order = [sign * ddata["ivl"].index(v) for v in dataset.dimension_values(d)]
+            if group_dim is not None:
+                other_dim = next(k for k in axis_names if k != d)
+                ddata, Z = self._compute_grouped_linkage(
+                    dataset, group_dim, other_dim, self.p.main_dim
+                )
+                order, ic = self._grouped_order_and_icoord(dataset, d, group_dim, ddata, Z, sign)
+            else:
+                ddata = self._compute_linkage(dataset, d, self.p.main_dim)
+                order = [sign * ddata["ivl"].index(v) for v in dataset.dimension_values(d)]
+                ic = ddata["icoord"]
             dataset = dataset.add_dimension(sort_dim, 0, order)
 
-            ic = ddata["icoord"]
             if self.p.invert:
-                ic = np.asarray(ic)
-                # Convert the smallest value to the largest value, while still
-                # being positive, offset (5) so we don't divide by zero
-                ic = ic.max() - ic + 5
+                # Reflect leaf positions within the axis's full span (each
+                # item occupies a width-10 slot in scipy's convention).
+                n_items = len(set(dataset.dimension_values(d)))
+                ic = 10 * n_items - np.asarray(ic)
             # Important the kdims are unique
             dendros[d] = Dendrogram(
                 ic, ddata["dcoord"], kdims=[f"__dendrogram_x_{d}", f"__dendrogram_y_{d}"]
@@ -1661,7 +1757,7 @@ class dendrogram(Operation):
             )
 
         for dim in map(str, main.kdims[::-1]):
-            if dim not in self.p.adjoint_dims:
+            if dim not in dendros:
                 main = main << Empty()
             else:
                 main = main << dendros[dim]
