@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import calendar
 import datetime as dt
-import re
 import time
 from collections import defaultdict
 from contextlib import contextmanager, suppress
@@ -208,14 +207,19 @@ def compute_plot_size(plot):
         widths, heights = zip(*[compute_plot_size(child) for child in plot.children], strict=None)
         return w_agg(widths), h_agg(heights)
     elif isinstance(plot, figure):
+
+        def border(side: str) -> int | None:
+            b = getattr(plot, f"min_border_{side}")
+            return (plot.min_border or 0) if b is None else b
+
         if plot.width:
             width = plot.width
         else:
-            width = plot.frame_width + plot.min_border_right + plot.min_border_left
+            width = plot.frame_width + border("right") + border("left")
         if plot.height:
             height = plot.height
         else:
-            height = plot.frame_height + plot.min_border_bottom + plot.min_border_top
+            height = plot.frame_height + border("bottom") + border("top")
         return width, height
     elif isinstance(plot, (Plot, DataTable, Spacer)):
         return plot.width, plot.height
@@ -589,19 +593,6 @@ def remove_legend(plot, legend):
             place.remove(legend)
 
 
-def font_size_to_pixels(size):
-    """Convert a fontsize to a pixel value"""
-    if size is None or not isinstance(size, str):
-        return
-    conversions = {"em": 16, "pt": 16 / 12.0}
-    val = re.findall(r"\d+", size)
-    unit = re.findall("[a-z]+", size)
-    if (val and not unit) or (val and unit[0] == "px"):
-        return int(val[0])
-    elif val and unit[0] in conversions:
-        return int(int(val[0]) * conversions[unit[0]])
-
-
 def make_axis(
     axis,
     size,
@@ -611,10 +602,8 @@ def make_axis(
     rotation=0,
     label_size=None,
     tick_size=None,
-    axis_height=35,
 ):
     factors = list(map(dim.pprint_value, factors))
-    nchars = np.max([len(f) for f in factors])
     ranges = FactorRange(factors=factors)
     ranges2 = Range1d(start=0, end=1)
     axis_label = dim_axis_label(dim)
@@ -628,45 +617,31 @@ def make_axis(
     if tick_size:
         axis_props["major_label_text_font_size"] = tick_size
 
-    tick_px = font_size_to_pixels(tick_size)
-    if tick_px is None:
-        tick_px = 8
-    label_px = font_size_to_pixels(label_size)
-    if label_px is None:
-        label_px = 10
-
     rotation = np.radians(rotation)
+    # A zero-size frame leaves only the axis: no panel for themes to draw, and bokeh fits the size to the labels.
     if axis == "x":
         align = "center"
-        # Adjust height to compensate for label rotation
-        height = (
-            int(axis_height + np.abs(np.sin(rotation)) * ((nchars * tick_px) * 0.82))
-            + tick_px
-            + label_px
-        )
         opts = dict(
             x_axis_type="auto",
             x_axis_label=axis_label,
             x_range=ranges,
             y_range=ranges2,
-            height=height,
+            frame_height=0,
+            height=None,
             width=size,
         )
     else:
-        # Adjust width to compensate for label rotation
         align = "left" if flip else "right"
-        width = (
-            int(axis_height + np.abs(np.cos(rotation)) * ((nchars * tick_px) * 0.82))
-            + tick_px
-            + label_px
-        )
         opts = dict(
-            y_axis_label=axis_label, x_range=ranges2, y_range=ranges, height=size, width=width
+            y_axis_label=axis_label,
+            x_range=ranges2,
+            y_range=ranges,
+            height=size,
+            width=None,
+            frame_width=0,
         )
 
-    p = figure(toolbar_location=None, tools=[], **opts)
-    p.outline_line_alpha = 0
-    p.grid.grid_line_alpha = 0
+    p = figure(toolbar_location=None, tools=[], min_border=0, **opts)
 
     if axis == "x":
         p.align = "end"

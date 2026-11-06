@@ -20,7 +20,7 @@
 builtdocs/
 .ipynb_checkpoints
 .coverage
-.pytest_cache
+.*cache
 .pixi
 holoviews/_version.py
 
